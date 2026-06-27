@@ -69,6 +69,9 @@ KEYWORDS_PATTERN = re.compile(
 )
 SPACES_PATTERN = re.compile(r"\s+")
 
+# Pattern to strip apostrophes and similar characters for normalization
+APOSTROPHE_PATTERN = re.compile(r"['\u2018\u2019\u02bc\u0060\u00b4]")
+
 # Total count cache for maintaining consistency across pages
 class TotalCountCache:
     def __init__(self, ttl_minutes=5):
@@ -138,22 +141,57 @@ class SearchCache:
 
 search_cache = SearchCache(ttl_minutes=5, max_size=1000)
 
-# Optimized regex pattern caching
+
+def normalize_query(query: str) -> str:
+    """
+    Normalize a search query by removing apostrophes and similar characters.
+    e.g. "Don't Call Me Ma'am" -> "Dont Call Me Maam"
+         "Siren's Kiss"        -> "Sirens Kiss"
+    """
+    # Replace typographic and standard apostrophes/backticks with empty string
+    normalized = APOSTROPHE_PATTERN.sub("", query)
+    # Collapse any resulting double spaces
+    normalized = SPACES_PATTERN.sub(" ", normalized).strip()
+    return normalized
+
+
 @lru_cache(maxsize=1000)
 def get_compiled_regex(query: str):
-    """Cache compiled regex patterns to avoid recompilation"""
+    """
+    Build a regex that matches BOTH the original query (with apostrophes)
+    AND the normalized version (without apostrophes).
+
+    Examples:
+      "Don't Call Me Ma'am"  -> also matches "Dont Call Me Maam"
+      "Siren's Kiss"         -> also matches "Sirens Kiss"
+    """
     query = query.strip()
     if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
-    else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_()]')
-    
+        return re.compile(r'.', re.IGNORECASE)
+
+    normalized = normalize_query(query)
+
+    def build_pattern(q: str) -> str:
+        if ' ' not in q:
+            # Single word: allow word/punctuation boundaries
+            return r'(\b|[\.\+\-_])' + re.escape(q) + r'(\b|[\.\+\-_])'
+        else:
+            # Multi-word: allow flexible separators between words
+            parts = q.split()
+            return r'[\s\.\+\-_()]*'.join(re.escape(p) for p in parts)
+
     try:
-        return re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
+        if normalized.lower() == query.lower():
+            # No difference after normalization — single pattern is enough
+            return re.compile(build_pattern(query), flags=re.IGNORECASE)
+        else:
+            # Combine original + normalized into an alternation so BOTH match
+            combined = f"(?:{build_pattern(query)}|{build_pattern(normalized)})"
+            return re.compile(combined, flags=re.IGNORECASE)
+    except Exception as e:
+        logger.warning(f"Regex compile error for query '{query}': {e}")
         return None
+
 
 @instance.register
 class Media(Document):
@@ -166,12 +204,11 @@ class Media(Document):
     caption = fields.StrField(allow_none=True)
     
     class Meta:
-        # Optimized indexes for cursor-based pagination
         indexes = (
-            '$file_name',  # Text index for search
-            [('file_name', 1), ('file_type', 1)],  # Compound index
-            [('caption', 1)],  # Caption search index
-            [('file_type', 1)],  # File type filtering
+            '$file_name',
+            [('file_name', 1), ('file_type', 1)],
+            [('caption', 1)],
+            [('file_type', 1)],
         )
         collection_name = COLLECTION_NAME
 
@@ -186,12 +223,11 @@ class Media2(Document):
     caption = fields.StrField(allow_none=True)
     
     class Meta:
-        # Optimized indexes for cursor-based pagination
         indexes = (
-            '$file_name',  # Text index for search
-            [('file_name', 1), ('file_type', 1)],  # Compound index
-            [('caption', 1)],  # Caption search index
-            [('file_type', 1)],  # File type filtering
+            '$file_name',
+            [('file_name', 1), ('file_type', 1)],
+            [('caption', 1)],
+            [('file_type', 1)],
         )
         collection_name = COLLECTION_NAME
 
@@ -215,7 +251,6 @@ async def check_db_size(db, cache):
 async def save_file(media):
     file_id, file_ref = unpack_new_file_id(media.file_id)
     
-    # Optimized file name cleaning with pre-compiled patterns
     file_name = SPECIAL_CHARS_PATTERN.sub(" ", str(media.file_name))
     file_name = KEYWORDS_PATTERN.sub(" ", file_name)
     file_name = SPACES_PATTERN.sub(" ", file_name).strip()
@@ -252,16 +287,13 @@ async def save_file(media):
 
 async def get_total_count(query: str, file_type: Optional[str] = None) -> int:
     """Get total count with caching to maintain consistency across pages"""
-    # Create cache key based on query and file_type
     count_cache_key = f"count:{query}:{file_type}"
     
-    # Check if we have cached count
     cached_count = total_count_cache.get(count_cache_key)
     if cached_count is not None:
         logger.debug(f"Using cached total count: {cached_count}")
         return cached_count
     
-    # Calculate new count
     regex = get_compiled_regex(query)
     if not regex:
         return 0
@@ -283,7 +315,6 @@ async def get_total_count(query: str, file_type: Optional[str] = None) -> int:
     else:
         total = await Media.count_documents(filter_query)
     
-    # Cache the count
     total_count_cache.set(count_cache_key, total)
     logger.debug(f"Calculated and cached total count: {total}")
     
@@ -292,19 +323,7 @@ async def get_total_count(query: str, file_type: Optional[str] = None) -> int:
 async def get_search_results(chat_id, query, file_type=None, max_results=10, offset=0, filter=False):
     """
     Enhanced search with cursor-based pagination for faster next page loads.
-    
-    Args:
-        chat_id: Chat ID for settings
-        query: Search query
-        file_type: Filter by file type
-        max_results: Number of results per page
-        offset: Can be either offset number or cursor string (ObjectId)
-        filter: Additional filters
-    
-    Returns:
-        Tuple of (files, next_offset, total_results)
     """
-    # Get settings
     if chat_id is not None:
         settings = await get_settings(int(chat_id))
         try:
@@ -314,18 +333,15 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
             settings = await get_settings(int(chat_id))
             max_results = 10 if settings.get('max_btn') else int(MAX_B_TN)
 
-    # Determine if using cursor or offset
     last_id = None
     is_cursor_based = False
     is_first_page = False
     
     if isinstance(offset, str) and offset and offset != '0' and offset != '':
         try:
-            # Try to parse as ObjectId cursor
             last_id = ObjectId(offset)
             is_cursor_based = True
         except:
-            # Fall back to offset-based
             try:
                 offset = int(offset)
                 is_first_page = (offset == 0)
@@ -333,28 +349,24 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
                 offset = 0
                 is_first_page = True
     elif isinstance(offset, int):
-        # Traditional offset
         is_first_page = (offset == 0)
     else:
         offset = 0
         is_first_page = True
 
-    # Check cache first
     cache_key = f"{chat_id}:{query}:{file_type}:{max_results}:{offset if not is_cursor_based else last_id}"
     cached_result = search_cache.get(cache_key)
     if cached_result:
         logger.debug(f"Cache hit for query: {query}")
-        # Even for cached results, fetch fresh total count
         total_results = await get_total_count(query, file_type)
         files, next_offset, _ = cached_result
         return files, next_offset, total_results
 
-    # Use cached compiled regex
+    # get_compiled_regex now handles apostrophe normalization internally
     regex = get_compiled_regex(query)
     if not regex:
         return [], '', 0
 
-    # Build filter query
     if USE_CAPTION_FILTER:
         filter_query = {'$or': [{'file_name': regex}, {'caption': regex}]}
     else:
@@ -363,18 +375,15 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
     if file_type:
         filter_query['file_type'] = file_type
     
-    # Add cursor-based pagination filter
     if is_cursor_based and last_id:
         filter_query['_id'] = {'$lt': last_id}
 
-    # Ensure max_results is even
     if max_results % 2 != 0:
         logger.info(f"Since max_results Is An Odd Number ({max_results}), Bot Will Use {max_results + 1} As max_results To Make It Even.")
         max_results += 1
 
-    # Projection for faster data retrieval
     projection = {
-        '_id': 1,  # Important for cursor
+        '_id': 1,
         'file_id': 1,
         'file_ref': 1,
         'file_name': 1,
@@ -384,11 +393,9 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
         'mime_type': 1
     }
 
-    # Always get total count (using cache)
     total_results = await get_total_count(query, file_type)
 
     if MULTIPLE_DB:
-        # Build queries with cursor or offset
         if is_cursor_based:
             cursor1 = Media.find(filter_query, projection).sort('_id', -1).limit(max_results)
             cursor2 = Media2.find(filter_query, projection).sort('_id', -1).limit(max_results)
@@ -396,19 +403,16 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
             cursor1 = Media.find(filter_query, projection).sort('$natural', -1).skip(offset).limit(max_results)
             cursor2 = Media2.find(filter_query, projection).sort('$natural', -1).skip(offset).limit(max_results)
         
-        # Execute queries in parallel
         files1, files2 = await asyncio.gather(
             cursor1.to_list(length=max_results),
             cursor2.to_list(length=max_results)
         )
         
-        # Merge and sort results
         if is_cursor_based:
             files = sorted(files1 + files2, key=lambda x: x.get('_id'), reverse=True)[:max_results]
         else:
             files = (files1 + files2)[:max_results]
     else:
-        # Single database
         if is_cursor_based:
             cursor = Media.find(filter_query, projection).sort('_id', -1).limit(max_results)
         else:
@@ -416,22 +420,16 @@ async def get_search_results(chat_id, query, file_type=None, max_results=10, off
         
         files = await cursor.to_list(length=max_results)
     
-    # Calculate next offset/cursor
     if is_cursor_based:
-        # Return cursor (ObjectId) for next page
         next_offset = str(files[-1]['_id']) if files else ''
     else:
-        # Return numeric offset
         next_offset = offset + len(files)
         if total_results > 0 and next_offset >= total_results:
             next_offset = ''
     
     result = (files, next_offset, total_results)
-    
-    # Cache the result (without total_results to save space, we'll fetch it fresh)
     search_cache.set(cache_key, (files, next_offset, total_results))
     
-    # Prefetch next page in background (optional)
     if files and next_offset:
         asyncio.create_task(prefetch_next_page(chat_id, query, file_type, max_results, next_offset))
     
@@ -441,7 +439,6 @@ async def prefetch_next_page(chat_id, query, file_type, max_results, current_off
     """Prefetch next page in background to improve UX"""
     try:
         cache_key = f"{chat_id}:{query}:{file_type}:{max_results}:{current_offset}"
-        # Only prefetch if not already cached
         if search_cache.get(cache_key) is None:
             await get_search_results(chat_id, query, file_type, max_results, current_offset)
             logger.debug(f"Prefetched next page for query: {query}")
@@ -449,12 +446,10 @@ async def prefetch_next_page(chat_id, query, file_type, max_results, current_off
         logger.debug(f"Prefetch failed (non-critical): {e}")
 
 async def get_bad_files(query, file_type=None):
-    # Use cached compiled regex
     regex = get_compiled_regex(query)
     if not regex:
         return [], 0
     
-    # Build filter query
     if USE_CAPTION_FILTER:
         filter_query = {'$or': [{'file_name': regex}, {'caption': regex}]}
     else:
@@ -464,7 +459,6 @@ async def get_bad_files(query, file_type=None):
         filter_query['file_type'] = file_type
     
     if MULTIPLE_DB:
-        # Parallel queries for both databases
         cursor1 = Media.find(filter_query).sort('$natural', -1)
         cursor2 = Media2.find(filter_query).sort('$natural', -1)
         
@@ -491,7 +485,6 @@ async def get_file_details(query):
     filter_query = {'file_id': query}
     
     if MULTIPLE_DB:
-        # Search both databases in parallel
         cursor1 = Media.find(filter_query)
         cursor2 = Media2.find(filter_query)
         
@@ -539,7 +532,6 @@ def unpack_new_file_id(new_file_id):
 
 async def siletxbotz_fetch_media(limit: int) -> List[dict]:
     try:
-        # Use projection to fetch only needed fields
         projection = {'file_name': 1, 'caption': 1}
         
         if MULTIPLE_DB:
@@ -622,7 +614,7 @@ async def siletxbotz_get_series(limit: int = 30) -> Dict[str, List[int]]:
         return {title: sorted(set(seasons))[:10] for title, seasons in grouped.items() if seasons}
     except Exception as e:
         logger.error(f"Error in siletxbotz_get_series: {e}")
-        return []
+        return {}
 
 # Utility functions
 def clear_search_cache():

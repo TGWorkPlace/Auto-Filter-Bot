@@ -11,7 +11,7 @@ from pyrogram.errors import MessageNotModified
 from utils import temp, get_readable_time
 from math import ceil
 from logging_helper import LOGGER
-
+from pyrogram.enums import ParseMode, ButtonStyle
 
 lock = asyncio.Lock()
 
@@ -40,7 +40,7 @@ async def index_files(bot, query):
     await msg.edit(
         "Starting Indexing",
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton('Cancel', callback_data='index_cancel')]]
+            [[InlineKeyboardButton('Cancel', callback_data='index_cancel', style=ButtonStyle.DANGER)]]
         )
     )
     try:
